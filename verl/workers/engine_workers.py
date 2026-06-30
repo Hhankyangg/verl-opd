@@ -451,6 +451,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
+        self.bagel_ref_scorer = None
         self.rollout: BaseRollout = None
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
@@ -517,29 +518,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
 
             # The ref model does not need to enable MTP; force it to false.
-            ref_config.model_config = deepcopy(model_config)
+            ref_model_omega = deepcopy(self.config.model)
+            if self.config.ref.get("model", None) is not None:
+                with open_dict(ref_model_omega):
+                    for key, value in self.config.ref.model.items():
+                        ref_model_omega[key] = value
+            ref_config.model_config = omega_conf_to_dataclass(ref_model_omega)
             ref_config.model_config.mtp = MtpConfig(enable=False)
 
-            # construct TrainingWorkerConfig
-            ref_training_config = TrainingWorkerConfig(
-                model_type=ref_config.model_config.get("model_type", "language_model"),
-                model_config=ref_config.model_config,
-                engine_config=ref_config.engine,
-                optimizer_config=ref_config.optim,
-                checkpoint_config=ref_config.checkpoint,
-            )
+            from verl.models.transformers.bagel_ref import BagelRefScorer
 
-            # assign engine configs
-            ref_training_config.engine_config.use_dynamic_bsz = self.config.ref.use_dynamic_bsz
-            ref_training_config.engine_config.infer_max_token_len_per_gpu = self.config.ref.ppo_max_token_len_per_gpu
-            ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
-                self.config.ref.ppo_micro_batch_size_per_gpu
-            )
-            ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            if ref_config.model_config.model_type == "bagel":
+                self.bagel_ref_scorer = BagelRefScorer(
+                    model_path=ref_config.model_config.local_path,
+                    device=torch.device(get_device_name()),
+                )
+                self._register_dispatch_collect_info(mesh_name="ref", dp_rank=self.rank, is_collect=True)
+            else:
+                self.bagel_ref_scorer = None
 
-            self.ref = self.ref_worker_cls(config=ref_training_config)
-            self.ref.reset()
-            self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
+                # construct TrainingWorkerConfig
+                ref_training_config = TrainingWorkerConfig(
+                    model_type=ref_config.model_config.get("model_type", "language_model"),
+                    model_config=ref_config.model_config,
+                    engine_config=ref_config.engine,
+                    optimizer_config=ref_config.optim,
+                    checkpoint_config=ref_config.checkpoint,
+                )
+
+                # assign engine configs
+                ref_training_config.engine_config.use_dynamic_bsz = self.config.ref.use_dynamic_bsz
+                ref_training_config.engine_config.infer_max_token_len_per_gpu = self.config.ref.ppo_max_token_len_per_gpu
+                ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
+                    self.config.ref.ppo_micro_batch_size_per_gpu
+                )
+                ref_training_config.engine_config.use_remove_padding = ref_config.model_config.get("use_remove_padding", False)
+
+                self.ref = self.ref_worker_cls(config=ref_training_config)
+                self.ref.reset()
+                self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model
         if "actor" in self.role:
@@ -594,29 +611,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
-            # TODO: move rollout_device_mesh into ServerAdapter
-            # 3.1 build rollout device mesh (sglang need only)
-            infer_tp = rollout_config.tensor_model_parallel_size * rollout_config.data_parallel_size
-            infer_pp = rollout_config.pipeline_model_parallel_size
-            infer_world_size = infer_tp * infer_pp
-            dp = self.world_size // infer_world_size
-            assert self.world_size % infer_world_size == 0, (
-                f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
-            )
-            rollout_device_mesh = init_device_mesh(
-                get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
-            )
+            if model_config.model_type == "bagel" and rollout_config.name == "bagel":
+                from verl.workers.rollout.bagel_rollout import BagelRollout
 
-            # 3.2 initialize rollout engine
-            rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
-            self.rollout = rollout_cls(
-                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-            )
+                if self.actor is None:
+                    raise ValueError("BAGEL in-process rollout requires colocated actor.")
+                actor_module = self.actor.engine.module
+                raw_actor_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
+                self.rollout = BagelRollout(
+                    actor_module=actor_module,
+                    tokenizer=raw_actor_module.tokenizer,
+                    rollout_config=rollout_config,
+                )
+                self._bagel_inprocess_rollout = True
+                self.base_sync_done = True
+                self.layered_summon = False
+                self.peft_merge = False
+            else:
+                # TODO: move rollout_device_mesh into ServerAdapter
+                # 3.1 build rollout device mesh (sglang need only)
+                infer_tp = rollout_config.tensor_model_parallel_size * rollout_config.data_parallel_size
+                infer_pp = rollout_config.pipeline_model_parallel_size
+                infer_world_size = infer_tp * infer_pp
+                dp = self.world_size // infer_world_size
+                assert self.world_size % infer_world_size == 0, (
+                    f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
+                )
+                rollout_device_mesh = init_device_mesh(
+                    get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
+                )
 
-            # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)
-            self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
-            self.layered_summon = self.config.rollout.get("layered_summon", False)
-            self.peft_merge: bool = model_config.lora.get("merge", False)
+                # 3.2 initialize rollout engine
+                rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
+                self.rollout = rollout_cls(
+                    config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+                )
+
+                # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)
+                self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+                self.layered_summon = self.config.rollout.get("layered_summon", False)
+                self.peft_merge: bool = model_config.lora.get("merge", False)
 
         # 4. build checkpoint engine
         if "actor" in self.role:
@@ -638,8 +672,89 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        if self.bagel_ref_scorer is not None:
+            output = self._compute_bagel_ref_log_prob(data)
+            return output.cpu() if output is not None else None
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
+
+    def _unwrap_non_tensor_batch(self, value):
+        if value is None:
+            return None
+        value = tu.unwrap_non_tensor_data(value)
+        if hasattr(value, "tolist"):
+            try:
+                return value.tolist()
+            except Exception:
+                pass
+        try:
+            return [tu.unwrap_non_tensor_data(item) for item in value]
+        except TypeError:
+            return value
+
+    def _get_bagel_image_refs(self, data: TensorDict):
+        image_refs_batch = self._unwrap_non_tensor_batch(data.get("bagel_image_refs", None))
+        if image_refs_batch is not None:
+            return image_refs_batch
+
+        extra_info_batch = self._unwrap_non_tensor_batch(data.get("extra_info", None))
+        if extra_info_batch is None:
+            return None
+        extracted_refs = []
+        for extra_info in extra_info_batch:
+            if isinstance(extra_info, dict):
+                extracted_refs.append(extra_info.get("bagel_image_refs", None))
+            else:
+                extracted_refs.append(None)
+        return extracted_refs
+
+    def _response_scores_to_sequence_nested(self, scores: torch.Tensor, data: TensorDict) -> torch.Tensor:
+        attention_mask = data["attention_mask"]
+        prompt_width = data["prompts"].shape[-1]
+        response_width = data["responses"].shape[-1]
+        prompt_lens = attention_mask[:, :prompt_width].sum(dim=1).to(torch.long)
+        response_lens = attention_mask[:, prompt_width : prompt_width + response_width].sum(dim=1).to(torch.long)
+
+        sequence_scores = []
+        for i, (prompt_len, response_len) in enumerate(zip(prompt_lens.tolist(), response_lens.tolist(), strict=True)):
+            if prompt_len <= 0:
+                raise ValueError("BAGEL ref scoring requires non-empty prompts.")
+            seq_score = torch.zeros(prompt_len + response_len, dtype=scores.dtype, device=scores.device)
+            if response_len > 0:
+                seq_score[prompt_len - 1 : prompt_len - 1 + response_len] = scores[i, :response_len]
+            sequence_scores.append(seq_score)
+        return torch.nested.as_nested_tensor(sequence_scores, layout=torch.jagged)
+
+    def _compute_bagel_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        raw_prompts = self._unwrap_non_tensor_batch(data.get("raw_prompt", None))
+        if raw_prompts is None:
+            raise ValueError("BAGEL ref scoring requires raw_prompt. Set data.return_raw_chat=True.")
+
+        image_refs_batch = self._get_bagel_image_refs(data)
+        if image_refs_batch is None:
+            raise ValueError("BAGEL ref scoring requires bagel_image_refs from the dataset adapter or extra_info.")
+
+        if not getattr(self, "_bagel_ref_debug_logged", False):
+            sample_image_refs = image_refs_batch[0] if len(image_refs_batch) > 0 else None
+            sample_image_count = len(sample_image_refs) if sample_image_refs is not None else 0
+            sample_placeholder_count = self.bagel_ref_scorer._count_image_placeholders(list(raw_prompts[0]))
+            logger.warning(
+                "BAGEL ref input debug: keys=%s has_bagel_image_refs=%s sample0_placeholders=%s sample0_images=%s",
+                sorted(data.keys()),
+                image_refs_batch is not None,
+                sample_placeholder_count,
+                sample_image_count,
+            )
+            self._bagel_ref_debug_logged = True
+
+        scores = self.bagel_ref_scorer.score_batch(
+            raw_prompts=raw_prompts,
+            image_refs_batch=image_refs_batch,
+            responses=data["responses"],
+            attention_mask=data["attention_mask"],
+        )
+        log_probs = self._response_scores_to_sequence_nested(scores, data)
+        return TensorDict({"log_probs": log_probs}, batch_size=data.batch_size)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -648,6 +763,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
+
+    def bagel_rollout_generate(
+        self,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict,
+        image_data=None,
+        raw_prompt=None,
+        **kwargs,
+    ):
+        if self.actor is None or self.config.model.get("model_type", "language_model") != "bagel":
+            raise ValueError("bagel_rollout_generate requires a BAGEL actor on this worker.")
+        if raw_prompt is None:
+            raise ValueError("BAGEL rollout generation requires raw_prompt.")
+
+        from verl.workers.rollout.replica import TokenOutput
+
+        max_tokens = sampling_params.get("max_tokens", sampling_params.get("max_new_tokens", self.config.rollout.response_length))
+        temperature = sampling_params.get("temperature", self.config.rollout.temperature)
+        do_sample = bool(temperature and temperature > 0)
+
+        actor_module = self.actor.engine.module
+        raw_actor_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
+        raw_actor_module.eval()
+        multi_modal_data = {"image": list(image_data or [])}
+        with torch.no_grad():
+            responses = actor_module(
+                mode="generate",
+                raw_prompts=[raw_prompt],
+                multi_modal_data_batch=[multi_modal_data],
+                max_length=int(max_tokens),
+                do_sample=do_sample,
+                temperature=float(temperature) if temperature else 1.0,
+            )
+        token_ids = responses[0].detach().cpu().tolist()
+        extra_fields = {"request_id": request_id}
+        if "global_steps" in kwargs:
+            extra_fields["global_steps"] = kwargs["global_steps"]
+        return TokenOutput(token_ids=token_ids, log_probs=None, stop_reason="length", num_preempted=0, extra_fields=extra_fields)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -695,6 +849,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+
+        if getattr(self, "_bagel_inprocess_rollout", False):
+            return
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":

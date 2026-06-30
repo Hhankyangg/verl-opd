@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -177,6 +179,22 @@ class HFModelConfig(BaseConfig):
                 self.tokenizer.chat_template = self.custom_chat_template
 
         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
+        local_config_json = os.path.join(self.local_hf_config_path, "config.json")
+        is_bagel_checkpoint = False
+        if os.path.exists(local_config_json):
+            with open(local_config_json, encoding="utf-8") as f:
+                is_bagel_checkpoint = json.load(f).get("model_type") == "bagel"
+
+        if self.model_type == "bagel" or is_bagel_checkpoint:
+            # BAGEL is not a Transformers AutoModel architecture. The BAGEL
+            # engine loads llm_config/vit_config/ema.safetensors directly.
+            self.model_type = "bagel"
+            self.hf_config = None
+            self.generation_config = None
+            self.architectures = ["Bagel"]
+            self.share_embeddings_and_output_weights = False
+            return
+
         self.generation_config = get_generation_config(
             self.local_hf_config_path, trust_remote_code=self.trust_remote_code
         )

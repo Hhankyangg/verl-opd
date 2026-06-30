@@ -374,10 +374,17 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_bagel():
+    from verl.workers.rollout.bagel_async_server import BagelReplica
+
+    return BagelReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("bagel", _load_bagel)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:

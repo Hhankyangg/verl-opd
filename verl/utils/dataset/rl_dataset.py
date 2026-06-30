@@ -388,6 +388,16 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         row_dict["raw_prompt"] = self._build_messages(row_dict, key=self.prompt_key)
 
+        row_dict_images = row_dict.get(self.image_key, None)
+        if row_dict_images:
+            # BAGEL teacher/student adapters rebuild their own vision inputs and
+            # cannot reuse Qwen/vLLM-processed tensors. Keep raw image refs before
+            # the generic dataset drops the image column.
+            row_dict["bagel_image_refs"] = copy.deepcopy(row_dict_images)
+            if "extra_info" not in row_dict or row_dict["extra_info"] is None:
+                row_dict["extra_info"] = dict()
+            row_dict["extra_info"]["bagel_image_refs"] = copy.deepcopy(row_dict_images)
+
         row_dict.pop(self.image_key, None)
         row_dict.pop(self.video_key, None)
         row_dict.pop(self.audio_key, None)

@@ -1,0 +1,4 @@
+*.parquet
+**/*.parquet
+!.gitignore
+!*/README.md
